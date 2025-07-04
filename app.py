@@ -1,52 +1,54 @@
 from flask import Flask, request, render_template
+from werkzeug.utils import secure_filename
 import os
+import tempfile
 import pymupdf4llm
 import subprocess
-import uuid
 
 app = Flask(__name__)
-UPLOAD_FOLDER = 'uploads'
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+app.config['MAX_CONTENT_LENGTH'] = 5 * 1024 * 1024  # 5 MB file size limit
 
-def pdf_to_wikitext(pdf_path):
-    base_name = os.path.splitext(os.path.basename(pdf_path))[0]
-    md_path = os.path.join(UPLOAD_FOLDER, f"{base_name}.md")
-    wiki_path = os.path.join(UPLOAD_FOLDER, f"{base_name}_wiki.txt")
+def pdf_to_wikitext(pdf_file):
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            filename = secure_filename(pdf_file.filename)
+            pdf_path = os.path.join(tmpdir, filename)
+            pdf_file.save(pdf_path)
 
-    # PDF → Markdown
-    md_text = pymupdf4llm.to_markdown(pdf_path)
-    with open(md_path, 'w') as f:
-        f.write(md_text)
+            base = os.path.splitext(filename)[0]
+            md_path = os.path.join(tmpdir, f"{base}.md")
+            wiki_path = os.path.join(tmpdir, f"{base}_wiki.txt")
 
-    # Markdown → Wikitext
-    subprocess.run(['pandoc', '-f', 'markdown', '-t', 'mediawiki', '-o', wiki_path, md_path], check=True)
+            # PDF → Markdown
+            md_text = pymupdf4llm.to_markdown(pdf_path)
+            with open(md_path, 'w') as f:
+                f.write(md_text)
 
-    with open(wiki_path, 'r') as f:
-        wiki_content=  f.read()
+            # Markdown → Wikitext (with timeout)
+            subprocess.run([
+                'pandoc', '-f', 'markdown', '-t', 'mediawiki',
+                '-o', wiki_path, md_path
+            ], check=True, timeout=5)
 
-    os.remove(pdf_path)
-    os.remove(md_path)
-    os.remove(wiki_path)
-
-    return wiki_content
+            with open(wiki_path, 'r') as f:
+                return f.read()
+    except subprocess.TimeoutExpired:
+        return "Conversion timed out. Please try again with a smaller file."
+    except Exception as e:
+        return f"Error: {str(e)}"
 
 @app.route('/', methods=['GET', 'POST'])
 def index():
     wiki_text = None
     if request.method == 'POST':
-        pdf = request.files['pdf']
-        if pdf:
-            filename = f"{uuid.uuid4().hex}.pdf"
-            path = os.path.join(UPLOAD_FOLDER, filename)
-            pdf.save(path)
-
-            try:
-                wiki_text = pdf_to_wikitext(path)
-            except Exception as e:
-                wiki_text = f"Error: {e}"
+        pdf = request.files.get('pdf')
+        if not pdf or not pdf.filename.lower().endswith('.pdf'):
+            wiki_text = "Invalid file type. Only PDFs are allowed."
+        else:
+            wiki_text = pdf_to_wikitext(pdf)
 
     return render_template('index.html', wiki_text=wiki_text)
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(host='0.0.0.0', port=5000, debug=False)
 
